@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -42,12 +44,14 @@ const (
 )
 
 type MCPClientConfig struct {
-	Type           MCPClientType   `json:"type"`
-	Config         json.RawMessage `json:"config"`
-	PanicIfInvalid bool            `json:"panicIfInvalid"`
-	LogEnabled     bool            `json:"logEnabled"`
-	AuthTokens     []string        `json:"authTokens"`
+	Type            MCPClientType   `json:"type"`
+	Config          json.RawMessage `json:"config"`
+	PanicIfInvalid  bool            `json:"panicIfInvalid"`
+	LogEnabled      bool            `json:"logEnabled"`
+	AuthTokens      []string        `json:"authTokens"`
+	InstallCommands []string        `json:"installCommands"`
 }
+
 type SSEServerConfig struct {
 	BaseURL          string   `json:"baseURL"`
 	Addr             string   `json:"addr"`
@@ -86,7 +90,7 @@ func start(config *Config) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var errorGroup errgroup.Group
+	var clientGroup errgroup.Group
 	httpMux := http.NewServeMux()
 	httpServer := &http.Server{
 		Addr:    config.Server.Addr,
@@ -96,49 +100,7 @@ func start(config *Config) {
 		Name:    config.Server.Name,
 		Version: config.Server.Version,
 	}
-	for name, clientConfig := range config.Clients {
-		mcpClient, err := newMCPClient(name, clientConfig)
-		if err != nil {
-			log.Fatalf("Failed to create MCP client: %v", err)
-		}
-		serverOpts := []server.ServerOption{
-			server.WithResourceCapabilities(true, true),
-			server.WithRecovery(),
-		}
-		if clientConfig.LogEnabled {
-			serverOpts = append(serverOpts, server.WithLogging())
-		}
-		mcpServer := server.NewMCPServer(
-			config.Server.Name,
-			config.Server.Version,
-			serverOpts...,
-		)
-		sseServer := server.NewSSEServer(mcpServer,
-			server.WithBaseURL(config.Server.BaseURL),
-			server.WithBasePath(name),
-		)
-		errorGroup.Go(func() error {
-			log.Printf("<%s> Connecting", name)
-			addErr := mcpClient.addToMCPServer(ctx, info, mcpServer)
-			if addErr != nil && clientConfig.PanicIfInvalid {
-				return addErr
-			}
-			log.Printf("<%s> Connected", name)
-			return nil
-		})
-		tokens := make([]string, 0, len(clientConfig.AuthTokens)+len(config.Server.GlobalAuthTokens))
-		tokens = append(tokens, clientConfig.AuthTokens...)
-		tokens = append(tokens, config.Server.GlobalAuthTokens...)
-		httpMux.Handle(fmt.Sprintf("/%s/", name), chainMiddleware(sseServer, newAuthMiddleware(tokens)))
-		httpServer.RegisterOnShutdown(func() {
-			log.Printf("Closing client %s", name)
-			_ = mcpClient.Close()
-		})
-	}
-	err := errorGroup.Wait()
-	if err != nil {
-		log.Fatalf("Failed to add clients: %v", err)
-	}
+
 	go func() {
 		log.Printf("Starting SSE server")
 		log.Printf("SSE server listening on %s", config.Server.Addr)
@@ -147,6 +109,102 @@ func start(config *Config) {
 			log.Fatalf("Failed to start server: %v", hErr)
 		}
 	}()
+
+	var installGroup errgroup.Group
+
+	for name, clientConfig := range config.Clients {
+		name := name
+		clientConfig := clientConfig
+		if len(clientConfig.InstallCommands) > 0 {
+			for _, installCommand := range clientConfig.InstallCommands {
+				installCommand := installCommand
+				installGroup.Go(func() error {
+					cmd := exec.CommandContext(ctx, "sh", "-c", installCommand)
+					var stdout, stderr bytes.Buffer
+					cmd.Stdout = &stdout
+					cmd.Stderr = &stderr
+
+					log.Printf("<%s> Running install command: %s", name, installCommand)
+					err := cmd.Run()
+					if err != nil {
+						log.Printf("<%s> Install command failed: %s, Error: %v, Stdout: %s, Stderr: %s", name, installCommand, err, stdout.String(), stderr.String())
+					} else {
+						log.Printf("<%s> Install command successful: %s, Stdout: %s, Stderr: %s", name, installCommand, stdout.String(), stderr.String())
+					}
+					return nil
+				})
+			}
+		}
+	}
+
+	log.Println("Waiting for all installations to complete...")
+	installGroup.Wait()
+	log.Printf("All installations attempted. Please check logs for any installation failures.")
+
+	for name, clientConfig := range config.Clients {
+		name := name
+		clientConfig := clientConfig
+		clientGroup.Go(func() error {
+			log.Printf("<%s> Creating client", name)
+			mcpClient, err := newMCPClient(name, clientConfig)
+			if err != nil {
+				log.Printf("<%s> Failed to create MCP client: %v", name, err)
+				if clientConfig.PanicIfInvalid {
+					return fmt.Errorf("failed to create MCP client %s: %v", name, err)
+				}
+				return nil
+			}
+
+			serverOpts := []server.ServerOption{
+				server.WithResourceCapabilities(true, true),
+				server.WithRecovery(),
+			}
+			if clientConfig.LogEnabled {
+				serverOpts = append(serverOpts, server.WithLogging())
+			}
+			mcpServer := server.NewMCPServer(
+				config.Server.Name,
+				config.Server.Version,
+				serverOpts...,
+			)
+			sseServer := server.NewSSEServer(mcpServer,
+				server.WithBaseURL(config.Server.BaseURL),
+				server.WithBasePath(name),
+			)
+
+			log.Printf("<%s> Connecting", name)
+			addErr := mcpClient.addToMCPServer(ctx, info, mcpServer)
+			if addErr != nil {
+				log.Printf("<%s> Failed to connect: %v", name, addErr)
+				if clientConfig.PanicIfInvalid {
+					return fmt.Errorf("failed to connect client %s: %v", name, addErr)
+				}
+				_ = mcpClient.Close()
+				return nil
+			}
+			log.Printf("<%s> Connected", name)
+
+			tokens := make([]string, 0, len(clientConfig.AuthTokens)+len(config.Server.GlobalAuthTokens))
+			tokens = append(tokens, clientConfig.AuthTokens...)
+			tokens = append(tokens, config.Server.GlobalAuthTokens...)
+			httpMux.Handle(fmt.Sprintf("/%s/", name), chainMiddleware(sseServer, newAuthMiddleware(tokens)))
+
+			httpServer.RegisterOnShutdown(func() {
+				log.Printf("Closing client %s", name)
+				_ = mcpClient.Close()
+			})
+
+			return nil
+		})
+	}
+
+	log.Println("Waiting for all clients to connect...")
+	err := clientGroup.Wait()
+	if err != nil {
+		log.Fatalf("Client initialization error: %v", err)
+	}
+	log.Println("All clients connection attempted.")
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -201,6 +259,9 @@ func newMCPClient(name string, conf MCPClientConfig) (*Client, error) {
 		}
 		mcpClient, err := client.NewStdioMCPClient(v.Command, envs, v.Args...)
 		if err != nil {
+			if conf.PanicIfInvalid {
+				return nil, fmt.Errorf("failed to create MCP client %s: %v", name, err)
+			}
 			return nil, err
 		}
 		return &Client{
@@ -215,6 +276,9 @@ func newMCPClient(name string, conf MCPClientConfig) (*Client, error) {
 		}
 		mcpClient, err := client.NewSSEMCPClient(v.URL, options...)
 		if err != nil {
+			if conf.PanicIfInvalid {
+				return nil, fmt.Errorf("failed to create MCP client %s: %v", name, err)
+			}
 			return nil, err
 		}
 		return &Client{
